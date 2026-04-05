@@ -1,0 +1,14 @@
+{
+  "id": "INSERT_YOUR_KAGGLE_USERNAME/gemma4-27b-a4b-tool-calling-finetune",
+  "title": "Gemma 4 27B-A4B Tool-Calling Fine-Tune",
+  "code_file": "Gemma4_27B_A4B_ToolCalling_FineTune_Kaggle.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_internet": "true",
+  "dataset_sources": [],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}
