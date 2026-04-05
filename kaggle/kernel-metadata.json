@@ -1,5 +1,5 @@
 {
-  "id": "mohamedtita/gemma4-e4b-tool-calling-finetune",
+  "id": "mohamedtita/gemma-4-e4b-tool-calling-fine-tune",
   "title": "Gemma 4 E4B Tool-Calling Fine-Tune",
   "code_file": "Gemma4_E4B_ToolCalling_FineTune_Kaggle.ipynb",
   "language": "python",
