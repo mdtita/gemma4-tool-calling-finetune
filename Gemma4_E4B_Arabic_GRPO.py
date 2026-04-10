@@ -203,25 +203,24 @@ def quality_reward(completions, **kwargs) -> list[float]:
 
 
 # ── Reward 5: Correctness (answer match) ─────────────────────────────
-def correctness_reward(completions, answer=None, **kwargs) -> list[float]:
+def correctness_reward(prompts, completions, answer, **kwargs) -> list[float]:
     """
     Reward for matching the expected answer (when available).
     Uses proximity — partial matches get partial reward.
     +3.0 for exact match
     +1.0 for partial match (answer is contained in response)
-    +0.0 if no answer provided (skip)
-    -1.0 for wrong answer when answer IS provided
-    """
-    if answer is None:
-        return [0.0] * len(completions)
+    -1.0 for wrong answer
 
+    Note: 'answer' is a list (one per sample in the batch), pulled from
+    the dataset's 'answer' column automatically by TRL.
+    """
     rewards = []
-    for completion in completions:
+    for completion, expected in zip(completions, answer):
         text = completion[0]["content"] if isinstance(completion, list) else completion
         extracted = extract_arabic_answer(text) or text
 
         # Normalize both for comparison
-        norm_expected = answer.strip().lower()
+        norm_expected = str(expected).strip().lower()
         norm_got = extracted.strip().lower()
 
         if norm_expected == norm_got:
@@ -246,12 +245,14 @@ def build_grpo_dataset():
     from datasets import load_dataset
     
     print("  Loading translated Arabic GSM8K for GRPO...")
-    ds = load_dataset("Omartificial-Intelligence-Space/Arabic-gsm8k-v2", split="train")
+    ds = load_dataset("Omartificial-Intelligence-Space/Arabic-gsm8k-v2", split="main_train")
 
     # Filter out empty answers or weird parsed artifacts
     ds = ds.filter(lambda x: x.get("question") and x.get("answer"))
 
-    # Convert to standard GRPO dict format
+    # Convert to standard GRPO dict format:
+    # Must have 'prompt' column (list of message dicts) + optional extra columns for reward kwargs.
+    # Must NOT have 'messages' column — TRL rejects datasets with both 'prompt' and 'messages'.
     def format_grpo(row):
         return {
             "prompt": [
@@ -261,7 +262,8 @@ def build_grpo_dataset():
             "answer": row["answer"]
         }
 
-    dataset = ds.map(format_grpo)
+    # Remove all source columns, keep only 'prompt' and 'answer'
+    dataset = ds.map(format_grpo, remove_columns=ds.column_names)
     
     # GSM8K is 7K+ rows, which is perfect for GRPO
     print(f"  GRPO dataset prepared with {len(dataset)} reasoning samples.")
@@ -296,25 +298,28 @@ def main():
         max_seq_length = MAX_SEQ_LENGTH,
         load_in_4bit   = LOAD_IN_4BIT,
         full_finetuning = False,
-        fast_inference  = True,    # Enables vLLM backend within Unsloth automatically
+        fast_inference  = False,    # Disabled because vLLM is not installed on this ROCm environment
         token          = HF_TOKEN or None,
     )
 
     # ── 2. LoRA for GRPO ───────────────────────────────────────────────
-    print("=== Adding LoRA Adapters for GRPO ===")
-    model = FastModel.get_peft_model(
-        model,
-        finetune_vision_layers     = False,
-        finetune_language_layers   = True,
-        finetune_attention_modules = True,
-        finetune_mlp_modules       = True,
-        r               = 16,
-        lora_alpha       = 16,
-        lora_dropout     = 0,
-        bias             = "none",
-        random_state     = 3407,
-        use_gradient_checkpointing = "unsloth",
-    )
+    if model_name == BASE_MODEL:
+        print("=== Adding new LoRA Adapters for GRPO ===")
+        model = FastModel.get_peft_model(
+            model,
+            finetune_vision_layers     = False,
+            finetune_language_layers   = True,
+            finetune_attention_modules = True,
+            finetune_mlp_modules       = True,
+            r               = 16,
+            lora_alpha       = 16,
+            lora_dropout     = 0,
+            bias             = "none",
+            random_state     = 3407,
+            use_gradient_checkpointing = "unsloth",
+        )
+    else:
+        print(f"=== Successfully loaded existing adapters from {model_name}. Skipping get_peft_model. ===")
 
     # ── 3. Chat Template ───────────────────────────────────────────────
     from unsloth.chat_templates import get_chat_template
@@ -366,7 +371,7 @@ def main():
 
     trainer = GRPOTrainer(
         model     = model,
-        tokenizer = tokenizer,
+        processing_class = tokenizer,
         train_dataset = dataset,
         reward_funcs = [
             arabic_language_reward,     # +2 for Arabic responses
