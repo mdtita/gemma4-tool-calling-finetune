@@ -37,12 +37,13 @@ import torch
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:256"
+os.environ["TORCHDYNAMO_DISABLE"] = "1"  # Prevent torch.compile from allocating huge temp buffers
 
 # ── Config ────────────────────────────────────────────────────────────────
 # Load from SFT adapter (post-SFT model)
 SFT_ADAPTER_PATH = "gemma4_e4b_arabic_lora"    # Local SFT output
 BASE_MODEL       = "unsloth/gemma-4-E4B-it"     # Fallback if no adapter
-MAX_SEQ_LENGTH   = 1024      # GSM8K questions are short — saves significant VRAM
+MAX_SEQ_LENGTH   = 512       # Reduced from 1024. GSM8K questions are short.
 DTYPE            = torch.bfloat16
 LOAD_IN_4BIT     = True
 OUTPUT_DIR       = os.path.expanduser("~/gemma4_runs/e4b_arabic_grpo")
@@ -50,12 +51,12 @@ HF_TOKEN         = os.environ.get("HF_TOKEN", "")
 HF_REPO_ID       = "mtita/gemma4-e4b-arabic-agent-grpo-lora"
 
 # GRPO hyperparams — tuned for 16 GB single-GPU
-NUM_GENERATIONS  = 4        # 4 is sufficient per DeepSeek GRPO paper (they used 4-16)
+NUM_GENERATIONS  = 2        # Minimum for GRPO relative comparison (higher OOMs on 16GB)
 MAX_STEPS        = 500      # Minimum 300 recommended
 LEARNING_RATE    = 5e-6     # Lower than SFT — fine-tuning existing knowledge
 BATCH_SIZE       = 1
 GRAD_ACCUM       = 4        # Effective batch = 4 (compensates for fewer generations)
-MAX_COMPLETION_LENGTH = 256 # GSM8K math answers are short — saves ~50% gen VRAM
+MAX_COMPLETION_LENGTH = 200 # Room for Arabic reasoning chains + short math answer
 
 
 # ── Arabic System Prompt ──────────────────────────────────────────────────
@@ -321,6 +322,9 @@ def main():
         )
     else:
         print(f"=== Successfully loaded existing adapters from {model_name}. Skipping get_peft_model. ===")
+        # CRITICAL: Since get_peft_model is skipped, gradient checkpointing was off!
+        # This causes massive 14GB VRAM spikes during the backward pass.
+        model.gradient_checkpointing_enable()
 
     # ── 3. Chat Template ───────────────────────────────────────────────
     from unsloth.chat_templates import get_chat_template
@@ -345,6 +349,7 @@ def main():
 
         # Generation
         num_generations       = NUM_GENERATIONS,
+        max_prompt_length     = 256,   # Critical to stop TRL from padding to 512/1024
         max_completion_length = MAX_COMPLETION_LENGTH,
 
         # Training
