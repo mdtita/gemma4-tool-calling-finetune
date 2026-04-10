@@ -31,6 +31,7 @@ import torch
 
 # Single GPU
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:256"
 
 # ── Config ────────────────────────────────────────────────────────────────
 MODEL_NAME       = "unsloth/gemma-4-E4B-it"
