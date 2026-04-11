@@ -29,15 +29,21 @@ Usage:
 """
 
 import os
+
+# ⚠️ CRITICAL: These MUST be set BEFORE `import torch`!
+# torch._dynamo reads TORCHDYNAMO_DISABLE at import time.
+# If set after, torch.compile's @decorator on Unsloth's logit function
+# pre-allocates a 1.25GB scratch buffer that causes instant OOM.
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:256"
+os.environ["TORCHDYNAMO_DISABLE"] = "1"
+
 import re
 import json
 import argparse
 
 import torch
-
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:256"
-os.environ["TORCHDYNAMO_DISABLE"] = "1"  # Prevent torch.compile from allocating huge temp buffers
+torch._dynamo.config.disable = True  # Belt-and-suspenders: ensure dynamo is truly off
 
 # ── Config ────────────────────────────────────────────────────────────────
 # Load from SFT adapter (post-SFT model)
@@ -50,13 +56,13 @@ OUTPUT_DIR       = os.path.expanduser("~/gemma4_runs/e4b_arabic_grpo")
 HF_TOKEN         = os.environ.get("HF_TOKEN", "")
 HF_REPO_ID       = "mtita/gemma4-e4b-arabic-agent-grpo-lora"
 
-# GRPO hyperparams — tuned for 16 GB single-GPU
-NUM_GENERATIONS  = 2        # Minimum for GRPO relative comparison (higher OOMs on 16GB)
+# GRPO hyperparams — tuned for 16 GB single-GPU with vocab-chunked logit fix
+NUM_GENERATIONS  = 2        # Maximum for 16GB (4 would OOM on forward pass activations)
 MAX_STEPS        = 500      # Minimum 300 recommended
 LEARNING_RATE    = 5e-6     # Lower than SFT — fine-tuning existing knowledge
 BATCH_SIZE       = 1
-GRAD_ACCUM       = 4        # Effective batch = 4 (compensates for fewer generations)
-MAX_COMPLETION_LENGTH = 200 # Room for Arabic reasoning chains + short math answer
+GRAD_ACCUM       = 8        # Effective batch = 8 (compensates for 2 generations, zero memory cost)
+MAX_COMPLETION_LENGTH = 256 # Longer reasoning chains (was 200 before OOM fix)
 
 
 # ── Arabic System Prompt ──────────────────────────────────────────────────
@@ -197,10 +203,12 @@ def quality_reward(completions, **kwargs) -> list[float]:
             rewards.append(-0.5)   # Still too short
         elif length > 2000:
             rewards.append(-0.5)   # Too verbose
-        elif length > 1000:
-            rewards.append(0.5)    # Detailed but maybe too long
         else:
-            rewards.append(1.0)    # Good length
+            # Continuous bonus favoring longer reasoning (up to 1000 chars)
+            # This serves a critical role: breaking reward ties when NUM_GENERATIONS=2.
+            # Without this, tied rewards result in reward_std=0 -> advantage=0 -> loss=0.
+            bonus = min((length / 1000.0) * 0.1, 0.1)  # max 0.1 bonus
+            rewards.append(1.0 + bonus) 
     return rewards
 
 
@@ -221,13 +229,22 @@ def correctness_reward(prompts, completions, answer, **kwargs) -> list[float]:
         text = completion[0]["content"] if isinstance(completion, list) else completion
         extracted = extract_arabic_answer(text) or text
 
-        # Normalize both for comparison
-        norm_expected = str(expected).strip().lower()
+        # GSM8K dataset includes the full reasoning trace before the actual answer.
+        # The final answer is always separated by "####".
+        # We MUST strip off the reasoning trace so we are only matching the final string/number!
+        expected_str = str(expected)
+        if "####" in expected_str:
+            expected_answer = expected_str.split("####")[-1].strip()
+        else:
+            expected_answer = expected_str.strip()
+
+        norm_expected = expected_answer.lower()
         norm_got = extracted.strip().lower()
 
+        # Check if the extracted expected number exists cleanly anywhere inside the generated answer block
         if norm_expected == norm_got:
             rewards.append(3.0)
-        elif norm_expected in norm_got or norm_got in norm_expected:
+        elif norm_expected in norm_got:
             rewards.append(1.0)
         else:
             rewards.append(-1.0)
@@ -341,6 +358,73 @@ def main():
     print("=== Setting up GRPO Trainer ===")
     from trl import GRPOTrainer, GRPOConfig
 
+    # ── CRITICAL FIX: Vocab-chunked logit computation ─────────────────
+    # Root cause: Any matmul with lm_head (262144×2560) on ROCm requires
+    # hipBLAS to create a 1.25GB contiguous copy of the transpose.
+    # Fix: Split the VOCAB dimension into 8192-token slices (each transpose
+    # is only ~40MB) and use online logsumexp for numerically-stable
+    # log-probabilities without materializing the full logit tensor.
+    import sys as _sys
+    _mod = _sys.modules.get('UnslothGRPOTrainer')
+    if _mod and hasattr(_mod, 'chunked_hidden_states_selective_log_softmax'):
+        _VOCAB_CHUNK = 8192  # Each slice: (8192, 2560) → transpose = 40MB
+
+        def _vocab_chunked_log_softmax(hidden_states, lm_head, index, chunks=4,
+                                        logit_scale_multiply=0.0, logit_scale_divide=0.0,
+                                        logit_softcapping=0.0, temperature=1.0):
+            """Vocab-chunked selective log-softmax that never allocates >40MB per op."""
+            flat_h = hidden_states.reshape(-1, hidden_states.shape[-1])  # (T, D)
+            flat_idx = index.reshape(-1)  # (T,)
+            T = flat_h.shape[0]
+            V = lm_head.shape[0]
+            flat_h_cast = flat_h.to(lm_head.dtype)
+
+            # Online logsumexp accumulators
+            selected_logits = torch.zeros(T, device=flat_h.device, dtype=torch.float32)
+            running_max = torch.full((T,), -1e30, device=flat_h.device, dtype=torch.float32)
+            running_sumexp = torch.zeros(T, device=flat_h.device, dtype=torch.float32)
+
+            for v_start in range(0, V, _VOCAB_CHUNK):
+                v_end = min(v_start + _VOCAB_CHUNK, V)
+                # Small matmul: (T, D) @ (D, chunk_V) — transpose is only ~40MB
+                w_slice = lm_head[v_start:v_end]  # (chunk_V, D) — contiguous slice
+                logits_slice = flat_h_cast @ w_slice.t()  # (T, chunk_V)
+
+                # Apply scaling
+                if logit_scale_multiply != 0.0:
+                    logits_slice = logits_slice * logit_scale_multiply
+                if logit_scale_divide != 0.0:
+                    logits_slice = logits_slice / logit_scale_divide
+                if logit_softcapping != 0.0:
+                    logits_slice = logits_slice * torch.tanh(logits_slice / logit_softcapping)
+
+                logits_slice = logits_slice.to(torch.float32)
+                if temperature != 1.0:
+                    logits_slice = logits_slice / temperature
+
+                # Gather: extract logits for tokens whose vocab index falls in [v_start, v_end)
+                mask = (flat_idx >= v_start) & (flat_idx < v_end)
+                if mask.any():
+                    local_idx = flat_idx[mask] - v_start
+                    rows = mask.nonzero(as_tuple=True)[0]
+                    selected_logits[rows] = logits_slice[rows, local_idx]
+
+                # Online logsumexp: update running max and sum of exponentials
+                chunk_max = logits_slice.max(dim=-1).values  # (T,)
+                new_max = torch.maximum(running_max, chunk_max)
+                running_sumexp = (running_sumexp * torch.exp(running_max - new_max) +
+                                  torch.exp(logits_slice - new_max.unsqueeze(-1)).sum(dim=-1))
+                running_max = new_max
+
+            # Final log-softmax: log(exp(selected) / sum(exp)) = selected - log(sum(exp))
+            log_probs = selected_logits - (torch.log(running_sumexp) + running_max)
+            return log_probs.reshape(hidden_states.shape[0], hidden_states.shape[1])
+
+        _mod.chunked_hidden_states_selective_log_softmax = _vocab_chunked_log_softmax
+        print(f"✅ Patched: vocab-chunked logit ({_VOCAB_CHUNK} slices) — max alloc ~{_VOCAB_CHUNK*2560*2//1024//1024}MB vs 1.25GB")
+    else:
+        print(f"⚠️ Could not patch logit function. Modules: {[n for n in _sys.modules if 'GRPO' in n]}")
+
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     grpo_config = GRPOConfig(
@@ -358,7 +442,7 @@ def main():
         per_device_train_batch_size = BATCH_SIZE,
         gradient_accumulation_steps = GRAD_ACCUM,
         warmup_steps          = 20,
-        optim                 = "adamw_8bit",
+        optim                 = "paged_adamw_8bit",
         weight_decay          = 0.01,
         lr_scheduler_type     = "cosine",
         seed                  = 3407,
@@ -371,8 +455,16 @@ def main():
         logging_steps         = 1,
 
         # GRPO specific
-        loss_type             = "gspo",
+        loss_type             = "grpo",
+        beta                  = 0.0,      # No KL penalty — avoids ref model computation entirely
         epsilon_high          = 0.28,
+        max_grad_norm         = 1.0,      # Clip exploding gradients
+
+        # Unsloth GRPO memory optimization — CRITICAL for Gemma 4's 256K vocab on 16GB
+        # Forces aggressive chunking of the lm_head logit projection to avoid the 1.25GB OOM
+        unsloth_num_chunks    = -1,    # Maximum efficiency for backward pass
+        unsloth_grpo_mini_batch = 1,   # Process 1 row at a time (minimizes peak VRAM)
+        unsloth_logit_chunk_multiplier = 16,  # Split logit computation into 16 micro-chunks
     )
 
     trainer = GRPOTrainer(
@@ -399,7 +491,14 @@ def main():
     max_mem = round(gpu_stats.total_memory / 1024**3, 3)
     print(f"  GPU: {gpu_stats.name} | Max: {max_mem} GB")
 
-    trainer_stats = trainer.train()
+    # Check for existing checkpoints to safely resume progress
+
+    checkpoints = [d for d in os.listdir(OUTPUT_DIR) if d.startswith("checkpoint-")] if os.path.exists(OUTPUT_DIR) else []
+    if checkpoints:
+        print(f"  Found {len(checkpoints)} checkpoints. Safely resuming from latest...")
+        trainer_stats = trainer.train(resume_from_checkpoint=True)
+    else:
+        trainer_stats = trainer.train()
 
     # ── 7. Stats ───────────────────────────────────────────────────────
     used = round(torch.cuda.max_memory_reserved() / 1024**3, 3)
@@ -411,11 +510,18 @@ def main():
     model.save_pretrained("gemma4_e4b_arabic_grpo_lora")
     tokenizer.save_pretrained("gemma4_e4b_arabic_grpo_lora")
 
+    print("=== Exporting to GGUF (q4_k_m) ===")
+    # Export to GGUF so it can be immediately run locally
+    model.save_pretrained_gguf("gemma4_e4b_arabic_grpo", tokenizer, quantization_method="q4_k_m")
+
     if HF_TOKEN:
         import huggingface_hub
         huggingface_hub.login(token=HF_TOKEN)
         model.push_to_hub(HF_REPO_ID, token=HF_TOKEN)
         tokenizer.push_to_hub(HF_REPO_ID, token=HF_TOKEN)
+        
+        print("=== Pushing GGUF to Hugging Face ===")
+        model.push_to_hub_gguf(HF_REPO_ID, tokenizer, quantization_method="q4_k_m", token=HF_TOKEN)
         print(f"Pushed to {HF_REPO_ID}")
 
     # ── 9. Test ────────────────────────────────────────────────────────
