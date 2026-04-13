@@ -9,7 +9,7 @@ def tool_format_reward(completions, **kwargs):
     """Reward for generating valid tool calls or attempting to do so."""
     rewards = []
     for comp in completions:
-        comp_str = comp[0]["content"] if isinstance(comp, list) and len(comp) > 0 else ""
+        comp_str = comp if isinstance(comp, str) else (comp[0]["content"] if isinstance(comp, list) and len(comp) > 0 else "")
         if "<tool_call>" in comp_str and "</tool_call>" in comp_str:
             # Check if valid JSON inside
             import json
@@ -33,7 +33,7 @@ def reasoning_structure_reward(completions, **kwargs):
     """Reward for reasoning before acting."""
     rewards = []
     for comp in completions:
-        comp_str = comp[0]["content"] if isinstance(comp, list) and len(comp) > 0 else ""
+        comp_str = comp if isinstance(comp, str) else (comp[0]["content"] if isinstance(comp, list) and len(comp) > 0 else "")
         if "<think>" in comp_str and "</think>" in comp_str:
             # Reward more for longer thoughts
             import re
@@ -80,6 +80,7 @@ def main():
         bias = "none",
         use_gradient_checkpointing = "unsloth",
         random_state = 3407,
+        max_seq_length = max_seq_length,
     )
     
     # If checkpoint existed, we would load_lora instead of creating new peft.
@@ -88,13 +89,13 @@ def main():
     from unsloth.chat_templates import get_chat_template
     tokenizer = get_chat_template(
         tokenizer,
-        chat_template = "qwen-2.5",
+        chat_template = "qwen3.5",
         mapping = {"role": "role", "content": "content", "user": "user", "assistant": "assistant", "system": "system"}
     )
     
     print("=== Loading Dataset ===")
     # Load same dataset
-    dataset = load_dataset('json', data_files='enhanced_agentic_dataset.jsonl', split='train')
+    dataset = load_dataset('json', data_files='qwen_unified_arabic_agent.jsonl', split='train')
     
     # GRPO requires only standard queries, we don't need formatting prompts func
     # Usually you format just the prompt for GRPO to generate the response

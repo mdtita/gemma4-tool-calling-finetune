@@ -66,7 +66,7 @@ def main():
     model = FastLanguageModel.get_peft_model(
         model,
         r = 16,
-        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        # Let Unsloth auto-detect optimal target modules for Qwen 3.5 architecture
         lora_alpha = 16,
         lora_dropout = 0,
         bias = "none",
@@ -81,24 +81,17 @@ def main():
     from unsloth.chat_templates import get_chat_template
     tokenizer = get_chat_template(
         tokenizer,
-        chat_template = "qwen-2.5",
-        mapping = {"role": "role", "content": "content", "user": "user", "assistant": "assistant", "system": "system"}
+        chat_template = "qwen3.5",
     )
     
-    # Overwrite the broken official template with our fixed C++ Jinja and token-efficient version
-    with open("qwen_fixed_template.jinja", "r", encoding="utf-8") as f:
-        tokenizer.chat_template = f.read()
+    # Unsloth auto-detects the correct Qwen 3.5 template — no manual override needed.
 
     def formatting_prompts_func(examples):
         texts = []
         for msgs in examples["messages"]:
             texts.append(tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False))
-        # Qwen3.5 is a Vision LM. The 1st argument of its processor is 'images', not 'text'.
-        # We MUST explicitly pass text=texts to avoid it attempting to parse the strings as images.
-        return tokenizer(text=texts, truncation=True, max_length=max_seq_length)
+        return {"text": texts}
     
-    # CRITICAL: We map to input_ids and attention_mask directly, and remove ALL text/dict columns
-    # We use num_proc=16 to accelerate formatting from 2 minutes down to ~10 seconds
     dataset = dataset.map(
         formatting_prompts_func, 
         batched=True, 
@@ -111,29 +104,39 @@ def main():
         model = model,
         processing_class = tokenizer,
         train_dataset = dataset,
-        max_seq_length = max_seq_length,
-        dataset_num_proc = 16, # Multi-threading for dataset formulation
-        packing = True, # 3-5x Speedup via Unsloth context stuffing
         args = SFTConfig(
+            dataset_text_field = "text",
+            max_seq_length = max_seq_length,
+            dataset_num_proc = 16,
+            packing = True,            # 3-5x Speedup via Unsloth context stuffing
             per_device_train_batch_size = 1,
-            gradient_accumulation_steps = 8,  # Stabilize QLoRA gradients
+            gradient_accumulation_steps = 8,
             warmup_steps = 20,
             learning_rate = 2e-5,
-            num_train_epochs = 1, # Full 28,000 array instead of 500 steps
+            num_train_epochs = 1,
             logging_steps = 5,
-            optim = "paged_adamw_8bit",       # Resolves Step N optimizer memory spikes!
+            optim = "adamw_8bit",       # Standard 8-bit optimizer for bf16 LoRA
             weight_decay = 0.01,
             lr_scheduler_type = "cosine",
             seed = 3407,
             output_dir = "outputs_qwen35_9B_arabic_sft",
             save_strategy = "steps",
             save_steps = 200,
+            save_total_limit = 3,
             report_to = "none",
-            bf16 = True, # Use amp calculations
+            bf16 = True,
         ),
     )
     
     print("=== Starting Qwen 9B SFT ===")
+    
+    # ── Masking: Train on Responses Only ──
+    from unsloth.chat_templates import train_on_responses_only
+    trainer = train_on_responses_only(
+        trainer,
+        instruction_part = "<|im_start|>user\n",
+        response_part    = "<|im_start|>assistant\n",
+    )
     
     checkpoints = [d for d in os.listdir("outputs_qwen35_9B_arabic_sft") if d.startswith("checkpoint-")] if os.path.exists("outputs_qwen35_9B_arabic_sft") else []
     if checkpoints:

@@ -1,6 +1,6 @@
 import os
 # Memory & Compilation optimizations MUST be set BEFORE importing torch
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+# NOTE: Do NOT set CUDA_VISIBLE_DEVICES here — we need both GPUs for bf16 LoRA
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:512"
 os.environ["TORCHDYNAMO_DISABLE"] = "1"
 
@@ -22,7 +22,7 @@ def tool_format_reward(completions, **kwargs):
     """Reward for generating universally valid tool calls."""
     rewards = []
     for comp in completions:
-        comp_str = comp[0]["content"] if isinstance(comp, list) and len(comp) > 0 else comp
+        comp_str = comp if isinstance(comp, str) else (comp[0]["content"] if isinstance(comp, list) and len(comp) > 0 else str(comp))
         
         # Continuous tie-breaker based on output length
         length_bonus = min((len(comp_str) / 2000.0) * 0.1, 0.1)
@@ -50,7 +50,7 @@ def reasoning_structure_reward(completions, **kwargs):
     """Reward for utilizing the universally compatible <think> structure correctly."""
     rewards = []
     for comp in completions:
-        comp_str = comp[0]["content"] if isinstance(comp, list) and len(comp) > 0 else comp
+        comp_str = comp if isinstance(comp, str) else (comp[0]["content"] if isinstance(comp, list) and len(comp) > 0 else str(comp))
         
         # Tie breaker based on reasoning length
         length_bonus = min((len(comp_str) / 2000.0) * 0.1, 0.1)
@@ -110,7 +110,7 @@ def main():
         model = FastLanguageModel.get_peft_model(
             model,
             r = 16,
-            target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            # Let Unsloth auto-detect optimal target modules for Qwen 3.5 architecture
             lora_alpha = 16,
             lora_dropout = 0,
             bias = "none",
@@ -155,7 +155,7 @@ def main():
             save_strategy = "steps",
             logging_steps = 5,
             output_dir = output_dir,
-            optim = "paged_adamw_8bit", # Solves Optimizer Momentum state init crash!
+            optim = "adamw_8bit",       # Standard 8-bit optimizer for bf16 LoRA
             loss_type = "grpo",
             beta = 0.0, # Math stability
             max_grad_norm = 1.0,
