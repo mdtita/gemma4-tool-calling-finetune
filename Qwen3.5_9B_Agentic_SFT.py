@@ -71,6 +71,9 @@ def main():
     model = FastLanguageModel.get_peft_model(
         model,
         r = 16,                # Lower rank to fit bf16 VRAM budget (was 32 for QLoRA)
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
+                          "gate_proj", "up_proj", "down_proj",
+                          "out_proj",],
         lora_alpha = 16,
         lora_dropout = 0,
         bias = "none",
@@ -86,12 +89,9 @@ def main():
     print("=== Loading Dataset ===")
     dataset = load_dataset('json', data_files='qwen_unified_arabic_agent.jsonl', split='train')
     
-    from unsloth.chat_templates import standardize_sharegpt, get_chat_template
-    tokenizer = get_chat_template(
-        tokenizer,
-        chat_template = "qwen3.5",
-        mapping = {"role": "role", "content": "content", "user": "user", "assistant": "assistant", "system": "system"}
-    )
+    # Qwen 3.5 tokenizer already includes the correct chat template.
+    # No get_chat_template() call needed — just use tokenizer.apply_chat_template() directly.
+    # Ref: https://github.com/unslothai/notebooks/blob/main/nb/Qwen_3_5_27B_A100(80GB).ipynb
     
     # Normalize non-standard roles (APIGen uses function_call/observation)
     ROLE_MAP = {"function_call": "assistant", "observation": "tool", "human": "user", "gpt": "assistant"}

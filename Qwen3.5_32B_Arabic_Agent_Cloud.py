@@ -28,12 +28,15 @@ def main():
     model = FastLanguageModel.get_peft_model(
         model,
         r = 32, # Higher rank for 32B capacity
-        # Let Unsloth auto-detect optimal target modules for Qwen 3.5 architecture
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
+                          "gate_proj", "up_proj", "down_proj",
+                          "out_proj",],
         lora_alpha = 32,
         lora_dropout = 0,
         bias = "none",
         use_gradient_checkpointing = "unsloth",
         random_state = 3407,
+        max_seq_length = 2048,
     )
     
     # 3. Download and prepare the curated dataset (Cloud instances start fresh)
@@ -44,11 +47,9 @@ def main():
 
     dataset = load_dataset('json', data_files='qwen_unified_arabic_agent.jsonl', split='train')
     
-    from unsloth.chat_templates import get_chat_template
-    tokenizer = get_chat_template(
-        tokenizer,
-        chat_template = "qwen3.5",
-    )
+    # Qwen 3.5 tokenizer already includes the correct chat template.
+    # No get_chat_template() call needed.
+    # Ref: https://github.com/unslothai/notebooks/blob/main/nb/Qwen_3_5_27B_A100(80GB).ipynb
 
     def formatting_prompts_func(examples):
         texts = [tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False) for msgs in examples["messages"]]

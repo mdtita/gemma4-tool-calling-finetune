@@ -110,12 +110,15 @@ def main():
         model = FastLanguageModel.get_peft_model(
             model,
             r = 16,
-            # Let Unsloth auto-detect optimal target modules for Qwen 3.5 architecture
+            target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
+                              "gate_proj", "up_proj", "down_proj",
+                              "out_proj",],
             lora_alpha = 16,
             lora_dropout = 0,
             bias = "none",
             use_gradient_checkpointing = "unsloth",
             random_state = 3407,
+            max_seq_length = max_seq_length,
         )
 
     # Use pure conversational logic for GRPO dataset extraction
