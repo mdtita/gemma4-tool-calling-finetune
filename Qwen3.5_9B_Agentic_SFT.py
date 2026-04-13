@@ -94,7 +94,7 @@ def main():
     # Ref: https://github.com/unslothai/notebooks/blob/main/nb/Qwen_3_5_27B_A100(80GB).ipynb
     
     # Normalize non-standard roles (APIGen uses function_call/observation)
-    ROLE_MAP = {"function_call": "assistant", "observation": "tool", "human": "user", "gpt": "assistant"}
+    ROLE_MAP = {"answer": "assistant", "tool_output": "tool", "function_call": "assistant", "observation": "tool", "human": "user", "gpt": "assistant"}
 
     def split_long_conversation(messages, max_tokens):
         """Split conversations exceeding max_tokens at turn boundaries.

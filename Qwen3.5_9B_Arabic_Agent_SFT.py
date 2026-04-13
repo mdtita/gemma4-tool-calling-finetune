@@ -85,10 +85,18 @@ def main():
     # No get_chat_template() call needed — just use tokenizer.apply_chat_template() directly.
     # Ref: https://github.com/unslothai/notebooks/blob/main/nb/Qwen_3_5_27B_A100(80GB).ipynb
 
+    # Qwen 3.5 template only accepts: system, user, assistant, tool
+    ROLE_MAP = {"answer": "assistant", "tool_output": "tool", "function_call": "assistant", "observation": "tool", "human": "user", "gpt": "assistant"}
+
+    def normalize_roles(messages):
+        """Map non-standard roles to Qwen 3.5 compatible ones."""
+        return [{"role": ROLE_MAP.get(m["role"], m["role"]), "content": m["content"]} for m in messages]
+
     def formatting_prompts_func(examples):
         texts = []
         for msgs in examples["messages"]:
-            texts.append(tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False))
+            normalized = normalize_roles(msgs)
+            texts.append(tokenizer.apply_chat_template(normalized, tokenize=False, add_generation_prompt=False))
         return {"text": texts}
     
     dataset = dataset.map(
